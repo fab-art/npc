@@ -772,7 +772,7 @@ def step_upload():
 
 def _sel(fkey, role, label, kws, hint=""):
     df = S.files.get(fkey)
-    if not df: return
+    if df is None: return
     cols = list(df.columns)
     ranked = sorted(cols, key=lambda c: sum(k.upper() in c.upper() for k in kws), reverse=True)
     saved = S.col_map.get(fkey, {}).get(role)
@@ -783,7 +783,7 @@ def _sel(fkey, role, label, kws, hint=""):
 
 def _sel_opt(fkey, role, label, kws):
     df = S.files.get(fkey)
-    if not df: return
+    if df is None: return
     cols = ["(none)"] + sorted(list(df.columns), key=lambda c: sum(k.upper() in c.upper() for k in kws), reverse=True)
     saved = S.col_map.get(fkey, {}).get(role, "(none)")
     idx = cols.index(saved) if saved in cols else 0
