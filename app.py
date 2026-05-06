@@ -1,22 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  Consumables Master Data Harmonization & Validation System                  ║
-║  IHS – NPC – PHC – RHIC Integration Tool   ·   v3.0 Online-Enhanced        ║
+║  IHS – NPC – PHC – RHIC Integration Tool   ·   v3.1 Ditto-Enhanced         ║
 ║  Rwanda FDA  |  SOP ODDG/RES/SOP/004                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-Search engines integrated (for hosted / online deployment):
+Online enrichment APIs:
   • openFDA Device Classification  — api.fda.gov/device/classification.json
   • openFDA 510k Clearance DB      — api.fda.gov/device/510k.json
   • DuckDuckGo Instant Answer API  — api.duckduckgo.com
-  • SerpAPI / Google Search        — serpapi.com  (optional: add SERPAPI_KEY to st.secrets)
-  • Serper  / Google Search        — serper.dev   (optional: add SERPER_KEY  to st.secrets)
-                                     Also powers the Verify & Approve step.
+  • SerpAPI / Google Search        — serpapi.com  (optional: SERPAPI_KEY)
+
+Verify & Approve step — Ditto entity matching (local, no API key needed):
+  • Uses pretrained language models (sentence-transformers) for semantic
+    similarity scoring of (original_description, NPC_description) pairs.
+  • Serialises records in Ditto's COL/VAL format before encoding.
+  • pip install sentence-transformers   (adds ~400 MB model on first run)
 
 API keys (optional — add to ~/.streamlit/secrets.toml on your server):
-  openfda_api_key = "..."    # raises openFDA from 1000 to 120000 req/day
+  openfda_api_key = "..."    # raises openFDA from 1000 to 120,000 req/day
   SERPAPI_KEY     = "..."    # enables Google Search enrichment via SerpAPI
-  SERPER_KEY      = "..."    # enables Google Search via Serper + Verify step
 """
 
 import streamlit as st
@@ -55,6 +58,12 @@ try:
     OPENPYXL_OK = True
 except ImportError:
     OPENPYXL_OK = False
+
+try:
+    from sentence_transformers import SentenceTransformer, util as st_util
+    SBERT_OK = True
+except ImportError:
+    SBERT_OK = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -246,25 +255,6 @@ def http_get(url: str, params: dict = None, host_key: str = "default",
     except Exception:
         return None
 
-
-def http_post(url: str, payload: dict, headers: dict = None,
-              host_key: str = "default", timeout: int = 10, min_gap: float = 0.5):
-    """Rate-limited POST → dict | None."""
-    sess = _get_session()
-    if sess is None:
-        return None
-    with _req_lock:
-        now = time.time()
-        gap = now - _last_req.get(host_key, 0)
-        if gap < min_gap:
-            time.sleep(min_gap - gap)
-        _last_req[host_key] = time.time()
-    try:
-        r = sess.post(url, json=payload, headers=headers or {}, timeout=timeout)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SEARCH ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,97 +380,6 @@ class SearchEngine:
             for r in data.get("organic_results", [])[:3]
         ]
 
-    # ── Serper (Google Search — faster, cheaper than SerpAPI) ────────────────
-    @staticmethod
-    def serper(query: str) -> list:
-        """
-        https://serper.dev — Google Search via Serper API (POST-based).
-        Requires SERPER_KEY in st.secrets.
-        Returns organic results + knowledge graph if present.
-        """
-        key = _api_key("SERPER_KEY")
-        if not key:
-            return []
-        data = http_post(
-            "https://google.serper.dev/search",
-            {"q": f"{query} medical device classification generic name", "num": 5},
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            host_key="serper", min_gap=0.5,
-        )
-        if not data:
-            return []
-        results = []
-        kg = data.get("knowledgeGraph", {})
-        if kg.get("title"):
-            results.append({
-                "source":  "Serper-KG",
-                "title":   kg.get("title", ""),
-                "snippet": kg.get("description", ""),
-                "link":    kg.get("website", ""),
-            })
-        for r in data.get("organic", [])[:3]:
-            results.append({
-                "source":  "Serper-Google",
-                "title":   r.get("title", ""),
-                "snippet": r.get("snippet", ""),
-                "link":    r.get("link", ""),
-            })
-        return results
-
-    @staticmethod
-    def serper_verify(original_desc: str, npc_desc: str) -> dict:
-        """
-        POST to Serper to check whether web evidence supports the
-        original_desc → npc_desc mapping.
-        Returns {"verified": CONFIRMED|PARTIAL|UNCONFIRMED|SKIPPED|ERROR,
-                 "score": float, "note": str, "snippet": str}
-        """
-        key = _api_key("SERPER_KEY")
-        if not key:
-            return {"verified": "SKIPPED", "score": 0.0,
-                    "note": "No SERPER_KEY configured", "snippet": ""}
-        query = f"{original_desc[:80]} medical device generic name classification"
-        data = http_post(
-            "https://google.serper.dev/search",
-            {"q": query, "num": 5},
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            host_key="serper_vrfy", min_gap=0.5,
-        )
-        if not data:
-            return {"verified": "ERROR", "score": 0.0,
-                    "note": "Serper API call failed", "snippet": ""}
-
-        npc_words  = {w for w in normalize(npc_desc).split()      if len(w) > 3}
-        orig_words = {w for w in normalize(original_desc).split() if len(w) > 3}
-        best_score, best_snippet = 0.0, ""
-
-        candidates = list(data.get("organic", []))
-        kg = data.get("knowledgeGraph", {})
-        if kg.get("title"):
-            candidates.insert(0, {"title": kg.get("title",""),
-                                   "snippet": kg.get("description","")})
-        for r in candidates[:6]:
-            text = (r.get("title","") + " " + r.get("snippet","")).upper()
-            npc_hit  = sum(1 for w in npc_words  if w in text) / max(len(npc_words), 1)
-            orig_hit = sum(1 for w in orig_words if w in text) / max(len(orig_words), 1)
-            score = npc_hit * 0.55 + orig_hit * 0.45
-            if score > best_score:
-                best_score   = score
-                best_snippet = r.get("snippet", "")[:220]
-
-        pct = f"{best_score:.0%}"
-        if best_score >= 0.50:
-            return {"verified": "CONFIRMED",   "score": best_score,
-                    "note": f"Web evidence strong ({pct})", "snippet": best_snippet}
-        elif best_score >= 0.25:
-            return {"verified": "PARTIAL",     "score": best_score,
-                    "note": f"Partial web evidence ({pct}) — review recommended",
-                    "snippet": best_snippet}
-        else:
-            return {"verified": "UNCONFIRMED", "score": best_score,
-                    "note": f"Low web evidence ({pct}) — manual check advised",
-                    "snippet": best_snippet}
-
     # ── Aggregate ─────────────────────────────────────────────────────────────
     @classmethod
     def enrich(cls, description: str, sources: list) -> dict:
@@ -546,17 +445,6 @@ class SearchEngine:
                 result["ONLINE_GENERIC_NAME"] = serp[0]["title"][:80]
                 used.append("SerpAPI")
 
-        if "serper" in sources:
-            serp2 = cls.serper(query)
-            if serp2:
-                if not result["ONLINE_GENERIC_NAME"]:
-                    result["ONLINE_GENERIC_NAME"] = serp2[0]["title"][:80]
-                if not result["ONLINE_DEFINITION"]:
-                    result["ONLINE_DEFINITION"] = serp2[0].get("snippet","")[:350]
-                if result["ONLINE_CONFIDENCE"] in ("LOW", ""):
-                    result["ONLINE_CONFIDENCE"] = "MEDIUM"
-                used.append("Serper")
-
         result["ONLINE_SOURCE"] = " + ".join(used) if used else "OFFLINE"
         S.enrich_cache[cache_key] = result
         return result
@@ -578,8 +466,119 @@ class SearchEngine:
         status["DuckDuckGo"] = d3 is not None
 
         status["SerpAPI (Google)"] = bool(_api_key("SERPAPI_KEY"))
-        status["Serper (Google)"]  = bool(_api_key("SERPER_KEY"))
+        status["Ditto / SBERT"]    = SBERT_OK
         return status
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DITTO ENTITY MATCHER
+# ─────────────────────────────────────────────────────────────────────────────
+_DITTO_MODEL_NAME = "all-MiniLM-L6-v2"   # fast, 80 MB; swap for
+                                           # "pritamdeka/S-PubMedBert-MS-MARCO"
+                                           # for biomedical domain boost
+
+def _ditto_serialize(desc: str) -> str:
+    """
+    Serialise a single product description in Ditto's COL/VAL format.
+    e.g. "LOCKING SCREW 3.5MM" → "COL description VAL LOCKING SCREW 3.5MM"
+    Multi-attribute records can extend this:
+        "COL description VAL ... COL family VAL SCREW ..."
+    """
+    return f"COL description VAL {desc.strip()}"
+
+
+class DittoMatcher:
+    """
+    Ditto-style entity matching for product description pairs.
+
+    Architecture
+    ────────────
+    1. Serialise each record with _ditto_serialize() into the standard
+       COL/VAL token format used by the original Ditto paper.
+    2. Encode both serialised strings with a SentenceTransformer model,
+       producing fixed-length sentence embeddings.
+    3. Compute cosine similarity → match decision + confidence score.
+
+    Thresholds (tunable via cls.T_MATCH / cls.T_POSSIBLE):
+      ≥ T_MATCH    → MATCH       (high semantic overlap)
+      ≥ T_POSSIBLE → POSSIBLE    (partial / ambiguous)
+      <  T_POSSIBLE → NO_MATCH
+
+    Thread-safety: model is loaded once and shared; encode() is read-only.
+    """
+    _model    = None
+    _lock     = threading.Lock()
+    T_MATCH   = 0.82   # cosine similarity → definite match
+    T_POSSIBLE= 0.58   # cosine similarity → possible match
+
+    @classmethod
+    def _load_model(cls):
+        if cls._model is None and SBERT_OK:
+            with cls._lock:
+                if cls._model is None:          # double-checked locking
+                    cls._model = SentenceTransformer(_DITTO_MODEL_NAME)
+        return cls._model
+
+    @classmethod
+    def available(cls) -> bool:
+        return SBERT_OK
+
+    @classmethod
+    def match_pair(cls, desc_a: str, desc_b: str) -> dict:
+        """
+        Score a single (original, NPC) pair.
+        Returns:
+            { "match": MATCH|POSSIBLE|NO_MATCH|UNAVAILABLE,
+              "score": float,  "note": str }
+        """
+        model = cls._load_model()
+        if model is None:
+            return {"match": "UNAVAILABLE", "score": 0.0,
+                    "note": "sentence-transformers not installed — run: pip install sentence-transformers"}
+        ser_a = _ditto_serialize(desc_a)
+        ser_b = _ditto_serialize(desc_b)
+        emb_a = model.encode(ser_a, convert_to_tensor=True, show_progress_bar=False)
+        emb_b = model.encode(ser_b, convert_to_tensor=True, show_progress_bar=False)
+        score = float(st_util.cos_sim(emb_a, emb_b)[0][0])
+        return cls._decision(score)
+
+    @classmethod
+    def batch_match(cls, pairs: list[tuple]) -> list[dict]:
+        """
+        Efficiently encode a batch of (desc_a, desc_b) pairs in one pass.
+        Returns a list of result dicts in the same order as pairs.
+        """
+        model = cls._load_model()
+        if model is None:
+            return [{"match": "UNAVAILABLE", "score": 0.0,
+                     "note": "sentence-transformers not installed"}
+                    for _ in pairs]
+        sers_a = [_ditto_serialize(a) for a, _ in pairs]
+        sers_b = [_ditto_serialize(b) for _, b in pairs]
+        # Encode both lists in a single batched call (GPU-friendly if available)
+        all_sers  = sers_a + sers_b
+        all_embs  = model.encode(all_sers, convert_to_tensor=True,
+                                  show_progress_bar=False, batch_size=64)
+        embs_a = all_embs[:len(pairs)]
+        embs_b = all_embs[len(pairs):]
+        results = []
+        for i in range(len(pairs)):
+            score = float(st_util.cos_sim(embs_a[i], embs_b[i])[0][0])
+            results.append(cls._decision(score))
+        return results
+
+    @classmethod
+    def _decision(cls, score: float) -> dict:
+        pct = f"{score:.1%}"
+        if score >= cls.T_MATCH:
+            return {"match": "MATCH",     "score": score,
+                    "note": f"Strong semantic match ({pct})"}
+        elif score >= cls.T_POSSIBLE:
+            return {"match": "POSSIBLE",  "score": score,
+                    "note": f"Possible match ({pct}) — review recommended"}
+        else:
+            return {"match": "NO_MATCH",  "score": score,
+                    "note": f"Low semantic similarity ({pct}) — likely mismatch"}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEXT PREPROCESSING
@@ -785,7 +784,7 @@ def build_excel(df: pd.DataFrame) -> bytes:
     cc  = df["CONFIDENCE"].value_counts()          if "CONFIDENCE"          in df.columns else pd.Series()
     vc  = df["VALIDATION_STATUS"].value_counts()   if "VALIDATION_STATUS"   in df.columns else pd.Series()
     enr = df["FDA_PRODUCT_CODE"].notna().sum()     if "FDA_PRODUCT_CODE"    in df.columns else 0
-    sv  = df["SERPER_VERIFIED"].value_counts()      if "SERPER_VERIFIED"     in df.columns else pd.Series()
+    sv  = df["DITTO_MATCH"].value_counts()          if "DITTO_MATCH"         in df.columns else pd.Series()
     rows = [
         ["IHS–NPC Harmonization Report  ·  v3.0 Online-Enhanced","","",""],
         [f"Generated: {datetime.now():%Y-%m-%d %H:%M}  |  Rwanda FDA  |  SOP ODDG/RES/SOP/004","","",""],
@@ -805,11 +804,11 @@ def build_excel(df: pd.DataFrame) -> bytes:
         ["ONLINE ENRICHMENT","","",""],
         ["FDA-enriched products", enr,"", "openFDA product codes found"],
         ["","","",""],
-        ["SERPER VERIFICATION","","",""],
-        ["Confirmed",   int(sv.get("CONFIRMED",0)),   "","Web evidence strong"],
-        ["Partial",     int(sv.get("PARTIAL",0)),     "","Review recommended"],
-        ["Unconfirmed", int(sv.get("UNCONFIRMED",0)), "","Manual check advised"],
-        ["Not checked", int(sv.get("NOT_CHECKED",0)), "",""],
+        ["DITTO ENTITY MATCHING","","",""],
+        ["Match",      int(sv.get("MATCH",0)),     "","Strong semantic similarity"],
+        ["Possible",   int(sv.get("POSSIBLE",0)),  "","Review recommended"],
+        ["No Match",   int(sv.get("NO_MATCH",0)),  "","Likely mismatch — check manually"],
+        ["Not checked",int(sv.get("NOT_CHECKED",0)),"",""],
     ]
     hf2 = PatternFill("solid", fgColor="1A5C1A")
     for i, rv in enumerate(rows, 1):
@@ -995,7 +994,6 @@ def step_configure():
             src_fda_5 = st.checkbox("openFDA 510k DB",         value=S.config.get("src_fda_5", True),  help="Cleared device generic names")
             src_ddg   = st.checkbox("DuckDuckGo Instant API",  value=S.config.get("src_ddg", True),   help="api.duckduckgo.com — free, no key, context lookup")
             src_serp  = st.checkbox("SerpAPI (Google)",        value=S.config.get("src_serp", False),  help="Requires SERPAPI_KEY in st.secrets")
-            src_serper= st.checkbox("Serper (Google — faster)", value=S.config.get("src_serper", False), help="Requires SERPER_KEY in st.secrets · serper.dev")
 
             enrich_scope = st.radio("Enrich which products?",
                                     ["UNMATCHED only","All rows"],
@@ -1007,12 +1005,11 @@ def step_configure():
 Add to <code>~/.streamlit/secrets.toml</code>:<br>
 <code>openfda_api_key = "YOUR_KEY"</code><br>
 <code>SERPAPI_KEY = "YOUR_SERPAPI_KEY"</code><br>
-<code>SERPER_KEY  = "YOUR_SERPER_KEY"</code><br>
-<small style="color:#8b949e">Without keys: openFDA = 1,000 req/day · SerpAPI/Serper = disabled<br>
-Serper also powers the Verify &amp; Approve step.</small>
+<small style="color:#8b949e">Without keys: openFDA = 1,000 req/day · SerpAPI = disabled<br>
+Verify &amp; Approve step uses <b>Ditto</b> (local, no key needed).</small>
 </div>""", unsafe_allow_html=True)
         else:
-            src_fda_c = src_fda_5 = src_ddg = src_serp = src_serper = False
+            src_fda_c = src_fda_5 = src_ddg = src_serp = False
             enrich_scope = "UNMATCHED only"; max_enrich = 0
 
         st.markdown('<div class="sh">Validation Rules</div>', unsafe_allow_html=True)
@@ -1029,7 +1026,6 @@ Serper also powers the Verify &amp; Approve step.</small>
                     use_brand=use_brand, max_rows=max_rows,
                     use_online=use_online, src_fda_c=src_fda_c,
                     src_fda_5=src_fda_5, src_ddg=src_ddg, src_serp=src_serp,
-                    src_serper=src_serper,
                     enrich_scope=enrich_scope, max_enrich=max_enrich,
                     active_rules=active_rules)
     st.markdown("---")
@@ -1113,7 +1109,6 @@ def step_process():
         if cfg.get("src_fda_5"): online_sources.append("openfda_510k")
         if cfg.get("src_ddg"):   online_sources.append("duckduckgo")
         if cfg.get("src_serp"):  online_sources.append("serpapi")
-        if cfg.get("src_serper"):online_sources.append("serper")
 
         if online_sources:
             scope = cfg.get("enrich_scope", "UNMATCHED only")
@@ -1163,7 +1158,7 @@ def step_process():
     online_cols = ["ONLINE_GENERIC_NAME","FDA_PRODUCT_CODE","FDA_DEVICE_CLASS",
                    "FDA_REGULATION","ONLINE_DEFINITION","ONLINE_SOURCE",
                    "ONLINE_CONFIDENCE","SUGGESTED_CATEGORY",
-                   "SERPER_VERIFIED","SERPER_NOTE","SERPER_SNIPPET"]
+                   "DITTO_MATCH","DITTO_SCORE","DITTO_NOTE"]
     ordered = [c for c in front if c in df_out.columns] + [c for c in online_cols if c in df_out.columns]
     S.results = df_out[ordered]; S.run_done = True
     n_rev = (S.results["VALIDATION_STATUS"]=="REVIEW").sum() if "VALIDATION_STATUS" in S.results.columns else 0
@@ -1272,176 +1267,196 @@ def step_review():
 
 def step_verify():
     st.markdown('<h1 class="pt">Verify & Approve</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="ps">Use Serper (Google Search) to cross-check flagged matches against live web evidence before exporting.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="ps">Ditto entity matching — pretrained language model scores semantic similarity between each original description and its matched NPC entry. Runs locally, no API key needed.</p>', unsafe_allow_html=True)
 
     df = S.results
     if df is None:
         st.warning("No results — run processing first.")
         return
 
-    has_serper = bool(_api_key("SERPER_KEY"))
-    if not has_serper:
-        st.warning("⚠ No **SERPER_KEY** found in `st.secrets`. Add it to enable web verification. You can still manually approve/reject rows below.")
+    if not DittoMatcher.available():
+        st.error("""**sentence-transformers not installed.**
+Run `pip install sentence-transformers` then restart the app.
+The Ditto matcher requires this package to load the pretrained language model.""")
+        st.markdown("---")
+        c1, _, c3 = st.columns([1,3,1])
+        with c1:
+            if st.button("← Back to Review", use_container_width=True): S.step=4; st.rerun()
+        with c3:
+            if st.button("Skip — Export anyway →", use_container_width=True): S.step=6; st.rerun()
+        return
 
-    # ── Identify rows needing verification ────────────────────────────────────
+    # ── Identify flagged rows ─────────────────────────────────────────────────
     needs_check = (
-        (df.get("VALIDATION_STATUS","") == "REVIEW") |
-        (df.get("CONFIDENCE","")         == "LOW")   |
-        (df.get("MATCH_SOURCE","")       == "UNMATCHED")
+        (df["VALIDATION_STATUS"] == "REVIEW") |
+        (df["CONFIDENCE"]         == "LOW")   |
+        (df["MATCH_SOURCE"]       == "UNMATCHED")
     ) if all(c in df.columns for c in ["VALIDATION_STATUS","CONFIDENCE","MATCH_SOURCE"]) \
       else pd.Series([True]*len(df))
 
-    flagged = df[needs_check].copy()
-    n_flag  = len(flagged)
+    n_flag  = int(needs_check.sum())
     n_total = len(df)
+    n_pass  = n_total - n_flag
 
-    k1,k2,k3 = st.columns(3)
+    k1,k2,k3,k4 = st.columns(4)
     for col, val, lbl, cls in [
-        (k1, f"{n_total:,}", "Total Rows",       "km"),
-        (k2, f"{n_flag:,}",  "Flagged for Check","ky"),
-        (k3, f"{n_total-n_flag:,}", "Auto-Pass", "kg"),
+        (k1, f"{n_total:,}", "Total Rows",         "km"),
+        (k2, f"{n_flag:,}",  "Flagged for Ditto",  "ky"),
+        (k3, f"{n_pass:,}",  "High-Conf Pass",     "kg"),
+        (k4, _DITTO_MODEL_NAME, "Model",            "kb"),
     ]:
         with col:
-            st.markdown(f'<div class="kc"><div class="kv {cls}">{val}</div><div class="kl">{lbl}</div></div>',
+            st.markdown(f'<div class="kc"><div class="kv {cls}" style="font-size:{"1.1rem" if len(str(val))>10 else "2rem"}">{val}</div><div class="kl">{lbl}</div></div>',
                         unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Run Serper verification ────────────────────────────────────────────────
-    if has_serper and not S.verify_done:
-        c_run, c_skip = st.columns([2,1])
-        with c_run:
-            max_v = st.number_input("Max rows to verify via Serper (0 = all flagged)",
-                                    0, 5000, min(500, n_flag), key="max_verify")
-        with c_skip:
-            st.markdown("<br>", unsafe_allow_html=True)
-            skip_verify = st.button("Skip — proceed to export without Serper check",
-                                     use_container_width=True)
-        if skip_verify:
-            S.verify_done = True
-            st.rerun()
+    # ── Run Ditto ──────────────────────────────────────────────────────────────
+    if not S.verify_done:
+        c_cfg, c_act = st.columns([3,2])
+        with c_cfg:
+            max_v = st.number_input(
+                "Max flagged rows to score (0 = all)",
+                0, 50000, min(1000, n_flag), key="max_ditto",
+                help="Ditto processes ~200–500 pairs/sec on CPU.")
+            t_match    = st.slider("MATCH threshold",    0.50, 0.99, DittoMatcher.T_MATCH,    0.01,
+                                    help="Cosine similarity ≥ this → MATCH")
+            t_possible = st.slider("POSSIBLE threshold", 0.30, 0.80, DittoMatcher.T_POSSIBLE, 0.01,
+                                    help="Cosine similarity ≥ this → POSSIBLE (else NO_MATCH)")
+            DittoMatcher.T_MATCH    = t_match
+            DittoMatcher.T_POSSIBLE = t_possible
+        with c_act:
+            st.markdown("<br><br>", unsafe_allow_html=True)
+            if st.button("Skip — export without Ditto scoring", use_container_width=True):
+                S.verify_done = True
+                st.rerun()
 
-        if st.button("🔍 Run Serper Verification", use_container_width=True, type="primary"):
-            batch = flagged.head(max_v) if max_v > 0 else flagged
-            unique_pairs = list({
-                (row["ORIGINAL_DESCRIPTION"], row["NPC_DESCRIPTION"])
-                for _, row in batch.iterrows()
-                if "ORIGINAL_DESCRIPTION" in row and "NPC_DESCRIPTION" in row
-            })
-            prog = st.progress(0, "Verifying…")
-            log_box = st.empty()
-            logs = []
-            def _log(msg):
-                logs.append(msg)
-                log_box.markdown('<div class="cb">' + "<br>".join(logs[-20:]) + "</div>",
+        if st.button("▶ Run Ditto Entity Matching", use_container_width=True, type="primary"):
+            flagged = df[needs_check]
+            batch   = flagged.head(max_v) if max_v > 0 else flagged
+
+            # Deduplicate pairs — don't score the same pair twice
+            seen, unique_pairs = set(), []
+            for _, row in batch.iterrows():
+                a = str(row.get("ORIGINAL_DESCRIPTION","")).strip()
+                b = str(row.get("NPC_DESCRIPTION","")).strip()
+                key = hashlib.md5((a+"|"+b).lower().encode()).hexdigest()
+                if key not in seen and a and b:
+                    seen.add(key)
+                    unique_pairs.append((a, b, key))
+
+            log_box  = st.empty()
+            prog     = st.progress(0, "Loading Ditto model…")
+            logs: list[str] = []
+            def _log(msg: str, kind: str = "ci"):
+                logs.append(f'<span class="{kind}">{msg}</span>')
+                log_box.markdown('<div class="cb">' + "<br>".join(logs[-25:]) + "</div>",
                                  unsafe_allow_html=True)
 
-            _log(f"Verifying {len(unique_pairs):,} unique pairs via Serper…")
-            cache = {}
+            _log(f"Ditto model: <span class='cn'>{_DITTO_MODEL_NAME}</span>")
+            _log(f"Unique pairs to score: <span class='co'>{len(unique_pairs):,}</span>")
+            _log("Serialising records in COL/VAL format…")
 
-            def _do(pair):
-                orig, npc = pair
-                key = hashlib.md5((orig+"|"+npc).lower().encode()).hexdigest()
-                if key in S.verify_cache:
-                    return orig, npc, S.verify_cache[key]
-                result = SearchEngine.serper_verify(orig, npc)
-                S.verify_cache[key] = result
-                return orig, npc, result
+            # Batch encode
+            pairs_only = [(a, b) for a, b, _ in unique_pairs]
+            prog.progress(0.05, "Encoding with sentence-transformer…")
+            try:
+                scores = DittoMatcher.batch_match(pairs_only)
+            except Exception as e:
+                st.error(f"Ditto error: {e}")
+                return
 
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                futures = {ex.submit(_do, p): p for p in unique_pairs}
-                done = 0
-                for fut in as_completed(futures):
-                    try:
-                        orig, npc, res = fut.result()
-                        cache_key = hashlib.md5((orig+"|"+npc).lower().encode()).hexdigest()
-                        cache[cache_key] = res
-                        v = res["verified"]
-                        icon = {"CONFIRMED":"✅","PARTIAL":"🟡","UNCONFIRMED":"🔴"}.get(v,"⚪")
-                        _log(f'<span class="co">{icon} {v}</span> · {orig[:55]}')
-                    except Exception as e:
-                        _log(f'<span class="ce">ERROR: {e}</span>')
-                    done += 1
-                    prog.progress(done / max(len(unique_pairs), 1), f"Verified {done}/{len(unique_pairs)}")
+            cache: dict = {}
+            for (a, b, key_hash), result in zip(unique_pairs, scores):
+                cache[key_hash] = result
+                S.verify_cache[key_hash] = result
 
-            # Stamp results onto S.results
-            def _lookup(row):
-                key = hashlib.md5(
-                    (str(row.get("ORIGINAL_DESCRIPTION",""))+"|"+str(row.get("NPC_DESCRIPTION",""))).lower().encode()
-                ).hexdigest()
-                hit = cache.get(key, S.verify_cache.get(key))
+            prog.progress(0.9, "Stamping results…")
+            match_col, score_col, note_col = [], [], []
+            for _, row in S.results.iterrows():
+                a = str(row.get("ORIGINAL_DESCRIPTION","")).strip()
+                b = str(row.get("NPC_DESCRIPTION","")).strip()
+                k = hashlib.md5((a+"|"+b).lower().encode()).hexdigest()
+                hit = cache.get(k, S.verify_cache.get(k))
                 if hit:
-                    return hit.get("verified","—"), hit.get("note",""), hit.get("snippet","")
-                return "NOT_CHECKED", "", ""
+                    match_col.append(hit["match"])
+                    score_col.append(round(hit["score"], 4))
+                    note_col.append(hit["note"])
+                else:
+                    match_col.append("NOT_CHECKED")
+                    score_col.append(None)
+                    note_col.append("")
 
-            vstat, vnote, vsnip = zip(*[_lookup(r) for _, r in S.results.iterrows()]) \
-                if len(S.results) else ([], [], [])
-            S.results["SERPER_VERIFIED"] = list(vstat)
-            S.results["SERPER_NOTE"]     = list(vnote)
-            S.results["SERPER_SNIPPET"]  = list(vsnip)
+            S.results["DITTO_MATCH"] = match_col
+            S.results["DITTO_SCORE"] = score_col
+            S.results["DITTO_NOTE"]  = note_col
             S.verify_done = True
-            n_conf   = sum(1 for v in vstat if v == "CONFIRMED")
-            n_part   = sum(1 for v in vstat if v == "PARTIAL")
-            n_unconf = sum(1 for v in vstat if v == "UNCONFIRMED")
-            st.success(f"✓ Verification done — Confirmed: {n_conf} · Partial: {n_part} · Unconfirmed: {n_unconf}")
+
+            n_match   = match_col.count("MATCH")
+            n_poss    = match_col.count("POSSIBLE")
+            n_nomatch = match_col.count("NO_MATCH")
+            for m in scores[:8]:
+                icon = {"MATCH":"✅","POSSIBLE":"🟡","NO_MATCH":"🔴"}.get(m["match"],"⚪")
+                _log(f'{icon} <span class="co">{m["match"]}</span> · score={m["score"]:.3f} · {m["note"]}')
+            prog.progress(1.0, "Done ✓")
+            st.success(f"✓ Ditto done — MATCH: {n_match:,} · POSSIBLE: {n_poss:,} · NO_MATCH: {n_nomatch:,}")
             st.rerun()
 
-    # ── Results table after verification ──────────────────────────────────────
+    # ── Results table ─────────────────────────────────────────────────────────
     if S.verify_done:
         df_v = S.results
-        if "SERPER_VERIFIED" in df_v.columns:
-            v_counts = df_v["SERPER_VERIFIED"].value_counts()
-            badges = {
-                "CONFIRMED":   ('<span style="color:#00e676">✅ CONFIRMED</span>',  int(v_counts.get("CONFIRMED",0))),
-                "PARTIAL":     ('<span style="color:#f0a500">🟡 PARTIAL</span>',    int(v_counts.get("PARTIAL",0))),
-                "UNCONFIRMED": ('<span style="color:#f85149">🔴 UNCONFIRMED</span>',int(v_counts.get("UNCONFIRMED",0))),
-                "NOT_CHECKED": ('<span style="color:#8b949e">⚪ NOT CHECKED</span>',int(v_counts.get("NOT_CHECKED",0))),
-                "SKIPPED":     ('<span style="color:#8b949e">— SKIPPED</span>',     int(v_counts.get("SKIPPED",0))),
-            }
-            parts = [f'{b} ({n:,})' for k,(b,n) in badges.items() if n > 0]
-            st.markdown("**Verification summary:** " + " &nbsp;·&nbsp; ".join(parts),
+        if "DITTO_MATCH" in df_v.columns:
+            mc = df_v["DITTO_MATCH"].value_counts()
+            badges = [
+                ('<span style="color:#00e676">✅ MATCH</span>',     int(mc.get("MATCH",0))),
+                ('<span style="color:#f0a500">🟡 POSSIBLE</span>',  int(mc.get("POSSIBLE",0))),
+                ('<span style="color:#f85149">🔴 NO_MATCH</span>',  int(mc.get("NO_MATCH",0))),
+                ('<span style="color:#8b949e">⚪ NOT_CHECKED</span>',int(mc.get("NOT_CHECKED",0))),
+            ]
+            st.markdown("**Ditto results:** " +
+                        " &nbsp;·&nbsp; ".join(f"{b} ({n:,})" for b, n in badges if n > 0),
                         unsafe_allow_html=True)
 
-        st.markdown('<div class="sh">Flagged rows</div>', unsafe_allow_html=True)
+            # Score distribution bar chart
+            scored = df_v[df_v["DITTO_SCORE"].notna()]
+            if len(scored):
+                bins = pd.cut(scored["DITTO_SCORE"], bins=[0,.4,.58,.75,.82,.90,.95,1.0],
+                              labels=["<0.40","0.40–0.58","0.58–0.75","0.75–0.82",
+                                      "0.82–0.90","0.90–0.95",">0.95"])
+                dist = bins.value_counts().sort_index().reset_index()
+                dist.columns = ["Similarity Band","Count"]
+                st.markdown('<div class="sh">Score distribution</div>', unsafe_allow_html=True)
+                st.bar_chart(dist.set_index("Similarity Band"), color="#388bfd", height=140)
 
+        st.markdown('<div class="sh">Flagged rows</div>', unsafe_allow_html=True)
         show_cols = ["RHIC_CODE","ORIGINAL_DESCRIPTION","NPC_CODE","NPC_DESCRIPTION",
                      "MATCH_SOURCE","CONFIDENCE","VALIDATION_STATUS"]
-        if "SERPER_VERIFIED" in df_v.columns:
-            show_cols += ["SERPER_VERIFIED","SERPER_NOTE"]
+        if "DITTO_MATCH"  in df_v.columns: show_cols.append("DITTO_MATCH")
+        if "DITTO_SCORE"  in df_v.columns: show_cols.append("DITTO_SCORE")
+        if "DITTO_NOTE"   in df_v.columns: show_cols.append("DITTO_NOTE")
         show_cols = [c for c in show_cols if c in df_v.columns]
 
-        # Filter to flagged rows; show all if user wants
-        filt_opts = ["Flagged only","All rows"]
-        if "SERPER_VERIFIED" in df_v.columns:
-            filt_opts = ["Flagged only","Unconfirmed only","All rows"]
-        filt = st.radio("Show", filt_opts, horizontal=True, key="verify_filter")
+        filt_opts = ["Flagged only","NO_MATCH only","All rows"]
+        filt = st.radio("Show", filt_opts, horizontal=True, key="ditto_filter")
         view = df_v.copy()
         if filt == "Flagged only":
             view = view[needs_check]
-        elif filt == "Unconfirmed only" and "SERPER_VERIFIED" in view.columns:
-            view = view[view["SERPER_VERIFIED"].isin(["UNCONFIRMED","PARTIAL","NOT_CHECKED"])]
+        elif filt == "NO_MATCH only" and "DITTO_MATCH" in view.columns:
+            view = view[view["DITTO_MATCH"].isin(["NO_MATCH","NOT_CHECKED"])]
 
-        def vstyle(row):
-            v = row.get("SERPER_VERIFIED","")
-            if v == "CONFIRMED":   return ["background:rgba(0,230,118,.07)"]*len(row)
-            if v == "PARTIAL":     return ["background:rgba(240,165,0,.07)"]*len(row)
-            if v == "UNCONFIRMED": return ["background:rgba(248,81,73,.09)"]*len(row)
+        def _vstyle(row):
+            v = row.get("DITTO_MATCH","")
+            if v == "MATCH":     return ["background:rgba(0,230,118,.07)"]*len(row)
+            if v == "POSSIBLE":  return ["background:rgba(240,165,0,.07)"]*len(row)
+            if v == "NO_MATCH":  return ["background:rgba(248,81,73,.09)"]*len(row)
             return ["background:rgba(139,148,158,.04)"]*len(row)
 
+        fmt = {"DITTO_SCORE": "{:.3f}", "MATCH_SCORE": "{:.0f}"}
         st.dataframe(
-            view[show_cols].style.apply(vstyle, axis=1).format(na_rep="—"),
-            use_container_width=True, height=400,
+            view[show_cols].style.apply(_vstyle, axis=1).format(
+                {k: v for k, v in fmt.items() if k in show_cols}, na_rep="—"),
+            use_container_width=True, height=420,
         )
-
-        if "SERPER_SNIPPET" in df_v.columns:
-            with st.expander("📄 Show web snippets for flagged rows"):
-                for _, row in view[view.get("SERPER_VERIFIED","").isin(["PARTIAL","UNCONFIRMED"])
-                        if "SERPER_VERIFIED" in view.columns else pd.Series(dtype=bool)].head(30).iterrows():
-                    snip = row.get("SERPER_SNIPPET","")
-                    if snip:
-                        st.markdown(f'**{row.get("ORIGINAL_DESCRIPTION","")[:60]}** → '
-                                    f'`{row.get("NPC_DESCRIPTION","")[:60]}`')
-                        st.caption(snip)
 
     st.markdown("---")
     c1, _, c3 = st.columns([1,3,1])
