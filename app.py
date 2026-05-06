@@ -10,10 +10,13 @@ Search engines integrated (for hosted / online deployment):
   • openFDA 510k Clearance DB      — api.fda.gov/device/510k.json
   • DuckDuckGo Instant Answer API  — api.duckduckgo.com
   • SerpAPI / Google Search        — serpapi.com  (optional: add SERPAPI_KEY to st.secrets)
+  • Serper  / Google Search        — serper.dev   (optional: add SERPER_KEY  to st.secrets)
+                                     Also powers the Verify & Approve step.
 
 API keys (optional — add to ~/.streamlit/secrets.toml on your server):
   openfda_api_key = "..."    # raises openFDA from 1000 to 120000 req/day
-  SERPAPI_KEY     = "..."    # enables Google Search enrichment
+  SERPAPI_KEY     = "..."    # enables Google Search enrichment via SerpAPI
+  SERPER_KEY      = "..."    # enables Google Search via Serper + Verify step
 """
 
 import streamlit as st
@@ -112,12 +115,13 @@ hr{border-color:var(--bd);}
 # ─────────────────────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
-STEPS = ["Upload", "Map Columns", "Configure", "Process & Enrich", "Review", "Export"]
+STEPS = ["Upload", "Map Columns", "Configure", "Process & Enrich", "Review", "Verify & Approve", "Export"]
 
 def _init():
     defs = dict(step=0, files={}, col_map={}, config={},
                 results=None, logs=[], run_done=False,
-                api_status={}, enrich_cache={})
+                api_status={}, enrich_cache={},
+                verify_cache={}, verify_done=False)
     for k, v in defs.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -239,6 +243,25 @@ def http_get(url: str, params: dict = None, host_key: str = "default",
     try:
         r = sess.get(url, params=params, timeout=timeout)
         return r.json() if r.status_code == 200 else ({} if r.status_code == 404 else None)
+    except Exception:
+        return None
+
+
+def http_post(url: str, payload: dict, headers: dict = None,
+              host_key: str = "default", timeout: int = 10, min_gap: float = 0.5):
+    """Rate-limited POST → dict | None."""
+    sess = _get_session()
+    if sess is None:
+        return None
+    with _req_lock:
+        now = time.time()
+        gap = now - _last_req.get(host_key, 0)
+        if gap < min_gap:
+            time.sleep(min_gap - gap)
+        _last_req[host_key] = time.time()
+    try:
+        r = sess.post(url, json=payload, headers=headers or {}, timeout=timeout)
+        return r.json() if r.status_code == 200 else None
     except Exception:
         return None
 
@@ -367,6 +390,97 @@ class SearchEngine:
             for r in data.get("organic_results", [])[:3]
         ]
 
+    # ── Serper (Google Search — faster, cheaper than SerpAPI) ────────────────
+    @staticmethod
+    def serper(query: str) -> list:
+        """
+        https://serper.dev — Google Search via Serper API (POST-based).
+        Requires SERPER_KEY in st.secrets.
+        Returns organic results + knowledge graph if present.
+        """
+        key = _api_key("SERPER_KEY")
+        if not key:
+            return []
+        data = http_post(
+            "https://google.serper.dev/search",
+            {"q": f"{query} medical device classification generic name", "num": 5},
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            host_key="serper", min_gap=0.5,
+        )
+        if not data:
+            return []
+        results = []
+        kg = data.get("knowledgeGraph", {})
+        if kg.get("title"):
+            results.append({
+                "source":  "Serper-KG",
+                "title":   kg.get("title", ""),
+                "snippet": kg.get("description", ""),
+                "link":    kg.get("website", ""),
+            })
+        for r in data.get("organic", [])[:3]:
+            results.append({
+                "source":  "Serper-Google",
+                "title":   r.get("title", ""),
+                "snippet": r.get("snippet", ""),
+                "link":    r.get("link", ""),
+            })
+        return results
+
+    @staticmethod
+    def serper_verify(original_desc: str, npc_desc: str) -> dict:
+        """
+        POST to Serper to check whether web evidence supports the
+        original_desc → npc_desc mapping.
+        Returns {"verified": CONFIRMED|PARTIAL|UNCONFIRMED|SKIPPED|ERROR,
+                 "score": float, "note": str, "snippet": str}
+        """
+        key = _api_key("SERPER_KEY")
+        if not key:
+            return {"verified": "SKIPPED", "score": 0.0,
+                    "note": "No SERPER_KEY configured", "snippet": ""}
+        query = f"{original_desc[:80]} medical device generic name classification"
+        data = http_post(
+            "https://google.serper.dev/search",
+            {"q": query, "num": 5},
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            host_key="serper_vrfy", min_gap=0.5,
+        )
+        if not data:
+            return {"verified": "ERROR", "score": 0.0,
+                    "note": "Serper API call failed", "snippet": ""}
+
+        npc_words  = {w for w in normalize(npc_desc).split()      if len(w) > 3}
+        orig_words = {w for w in normalize(original_desc).split() if len(w) > 3}
+        best_score, best_snippet = 0.0, ""
+
+        candidates = list(data.get("organic", []))
+        kg = data.get("knowledgeGraph", {})
+        if kg.get("title"):
+            candidates.insert(0, {"title": kg.get("title",""),
+                                   "snippet": kg.get("description","")})
+        for r in candidates[:6]:
+            text = (r.get("title","") + " " + r.get("snippet","")).upper()
+            npc_hit  = sum(1 for w in npc_words  if w in text) / max(len(npc_words), 1)
+            orig_hit = sum(1 for w in orig_words if w in text) / max(len(orig_words), 1)
+            score = npc_hit * 0.55 + orig_hit * 0.45
+            if score > best_score:
+                best_score   = score
+                best_snippet = r.get("snippet", "")[:220]
+
+        pct = f"{best_score:.0%}"
+        if best_score >= 0.50:
+            return {"verified": "CONFIRMED",   "score": best_score,
+                    "note": f"Web evidence strong ({pct})", "snippet": best_snippet}
+        elif best_score >= 0.25:
+            return {"verified": "PARTIAL",     "score": best_score,
+                    "note": f"Partial web evidence ({pct}) — review recommended",
+                    "snippet": best_snippet}
+        else:
+            return {"verified": "UNCONFIRMED", "score": best_score,
+                    "note": f"Low web evidence ({pct}) — manual check advised",
+                    "snippet": best_snippet}
+
     # ── Aggregate ─────────────────────────────────────────────────────────────
     @classmethod
     def enrich(cls, description: str, sources: list) -> dict:
@@ -432,6 +546,17 @@ class SearchEngine:
                 result["ONLINE_GENERIC_NAME"] = serp[0]["title"][:80]
                 used.append("SerpAPI")
 
+        if "serper" in sources:
+            serp2 = cls.serper(query)
+            if serp2:
+                if not result["ONLINE_GENERIC_NAME"]:
+                    result["ONLINE_GENERIC_NAME"] = serp2[0]["title"][:80]
+                if not result["ONLINE_DEFINITION"]:
+                    result["ONLINE_DEFINITION"] = serp2[0].get("snippet","")[:350]
+                if result["ONLINE_CONFIDENCE"] in ("LOW", ""):
+                    result["ONLINE_CONFIDENCE"] = "MEDIUM"
+                used.append("Serper")
+
         result["ONLINE_SOURCE"] = " + ".join(used) if used else "OFFLINE"
         S.enrich_cache[cache_key] = result
         return result
@@ -453,6 +578,7 @@ class SearchEngine:
         status["DuckDuckGo"] = d3 is not None
 
         status["SerpAPI (Google)"] = bool(_api_key("SERPAPI_KEY"))
+        status["Serper (Google)"]  = bool(_api_key("SERPER_KEY"))
         return status
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -647,8 +773,8 @@ def build_excel(df: pd.DataFrame) -> bytes:
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     for i, col in enumerate(cols, 1):
-        w = 65 if any(x in col for x in ["DESCRIPTION","DEFINITION","COMMENT"]) else \
-            18 if any(x in col for x in ["CODE","SOURCE","TYPE"]) else \
+        w = 65 if any(x in col for x in ["DESCRIPTION","DEFINITION","COMMENT","SNIPPET"]) else \
+            18 if any(x in col for x in ["CODE","SOURCE","TYPE","VERIFIED"]) else \
             14 if any(x in col for x in ["SCORE","CLASS","CONFIDENCE"]) else 22
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -659,6 +785,7 @@ def build_excel(df: pd.DataFrame) -> bytes:
     cc  = df["CONFIDENCE"].value_counts()          if "CONFIDENCE"          in df.columns else pd.Series()
     vc  = df["VALIDATION_STATUS"].value_counts()   if "VALIDATION_STATUS"   in df.columns else pd.Series()
     enr = df["FDA_PRODUCT_CODE"].notna().sum()     if "FDA_PRODUCT_CODE"    in df.columns else 0
+    sv  = df["SERPER_VERIFIED"].value_counts()      if "SERPER_VERIFIED"     in df.columns else pd.Series()
     rows = [
         ["IHS–NPC Harmonization Report  ·  v3.0 Online-Enhanced","","",""],
         [f"Generated: {datetime.now():%Y-%m-%d %H:%M}  |  Rwanda FDA  |  SOP ODDG/RES/SOP/004","","",""],
@@ -677,6 +804,12 @@ def build_excel(df: pd.DataFrame) -> bytes:
         ["","","",""],
         ["ONLINE ENRICHMENT","","",""],
         ["FDA-enriched products", enr,"", "openFDA product codes found"],
+        ["","","",""],
+        ["SERPER VERIFICATION","","",""],
+        ["Confirmed",   int(sv.get("CONFIRMED",0)),   "","Web evidence strong"],
+        ["Partial",     int(sv.get("PARTIAL",0)),     "","Review recommended"],
+        ["Unconfirmed", int(sv.get("UNCONFIRMED",0)), "","Manual check advised"],
+        ["Not checked", int(sv.get("NOT_CHECKED",0)), "",""],
     ]
     hf2 = PatternFill("solid", fgColor="1A5C1A")
     for i, rv in enumerate(rows, 1):
@@ -862,6 +995,7 @@ def step_configure():
             src_fda_5 = st.checkbox("openFDA 510k DB",         value=S.config.get("src_fda_5", True),  help="Cleared device generic names")
             src_ddg   = st.checkbox("DuckDuckGo Instant API",  value=S.config.get("src_ddg", True),   help="api.duckduckgo.com — free, no key, context lookup")
             src_serp  = st.checkbox("SerpAPI (Google)",        value=S.config.get("src_serp", False),  help="Requires SERPAPI_KEY in st.secrets")
+            src_serper= st.checkbox("Serper (Google — faster)", value=S.config.get("src_serper", False), help="Requires SERPER_KEY in st.secrets · serper.dev")
 
             enrich_scope = st.radio("Enrich which products?",
                                     ["UNMATCHED only","All rows"],
@@ -873,10 +1007,12 @@ def step_configure():
 Add to <code>~/.streamlit/secrets.toml</code>:<br>
 <code>openfda_api_key = "YOUR_KEY"</code><br>
 <code>SERPAPI_KEY = "YOUR_SERPAPI_KEY"</code><br>
-<small style="color:#8b949e">Without keys: openFDA = 1,000 req/day · SerpAPI = disabled</small>
+<code>SERPER_KEY  = "YOUR_SERPER_KEY"</code><br>
+<small style="color:#8b949e">Without keys: openFDA = 1,000 req/day · SerpAPI/Serper = disabled<br>
+Serper also powers the Verify &amp; Approve step.</small>
 </div>""", unsafe_allow_html=True)
         else:
-            src_fda_c = src_fda_5 = src_ddg = src_serp = False
+            src_fda_c = src_fda_5 = src_ddg = src_serp = src_serper = False
             enrich_scope = "UNMATCHED only"; max_enrich = 0
 
         st.markdown('<div class="sh">Validation Rules</div>', unsafe_allow_html=True)
@@ -893,6 +1029,7 @@ Add to <code>~/.streamlit/secrets.toml</code>:<br>
                     use_brand=use_brand, max_rows=max_rows,
                     use_online=use_online, src_fda_c=src_fda_c,
                     src_fda_5=src_fda_5, src_ddg=src_ddg, src_serp=src_serp,
+                    src_serper=src_serper,
                     enrich_scope=enrich_scope, max_enrich=max_enrich,
                     active_rules=active_rules)
     st.markdown("---")
@@ -976,6 +1113,7 @@ def step_process():
         if cfg.get("src_fda_5"): online_sources.append("openfda_510k")
         if cfg.get("src_ddg"):   online_sources.append("duckduckgo")
         if cfg.get("src_serp"):  online_sources.append("serpapi")
+        if cfg.get("src_serper"):online_sources.append("serper")
 
         if online_sources:
             scope = cfg.get("enrich_scope", "UNMATCHED only")
@@ -1024,7 +1162,8 @@ def step_process():
              "VALIDATION_STATUS","VALIDATION_COMMENT","PRODUCT_FAMILY"]
     online_cols = ["ONLINE_GENERIC_NAME","FDA_PRODUCT_CODE","FDA_DEVICE_CLASS",
                    "FDA_REGULATION","ONLINE_DEFINITION","ONLINE_SOURCE",
-                   "ONLINE_CONFIDENCE","SUGGESTED_CATEGORY"]
+                   "ONLINE_CONFIDENCE","SUGGESTED_CATEGORY",
+                   "SERPER_VERIFIED","SERPER_NOTE","SERPER_SNIPPET"]
     ordered = [c for c in front if c in df_out.columns] + [c for c in online_cols if c in df_out.columns]
     S.results = df_out[ordered]; S.run_done = True
     n_rev = (S.results["VALIDATION_STATUS"]=="REVIEW").sum() if "VALIDATION_STATUS" in S.results.columns else 0
@@ -1128,7 +1267,188 @@ def step_review():
     with c1:
         if st.button("← Back", use_container_width=True): S.step=3; st.rerun()
     with c3:
-        if st.button("Export →", use_container_width=True): S.step=5; st.rerun()
+        if st.button("Verify & Approve →", use_container_width=True): S.step=5; st.rerun()
+
+
+def step_verify():
+    st.markdown('<h1 class="pt">Verify & Approve</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="ps">Use Serper (Google Search) to cross-check flagged matches against live web evidence before exporting.</p>', unsafe_allow_html=True)
+
+    df = S.results
+    if df is None:
+        st.warning("No results — run processing first.")
+        return
+
+    has_serper = bool(_api_key("SERPER_KEY"))
+    if not has_serper:
+        st.warning("⚠ No **SERPER_KEY** found in `st.secrets`. Add it to enable web verification. You can still manually approve/reject rows below.")
+
+    # ── Identify rows needing verification ────────────────────────────────────
+    needs_check = (
+        (df.get("VALIDATION_STATUS","") == "REVIEW") |
+        (df.get("CONFIDENCE","")         == "LOW")   |
+        (df.get("MATCH_SOURCE","")       == "UNMATCHED")
+    ) if all(c in df.columns for c in ["VALIDATION_STATUS","CONFIDENCE","MATCH_SOURCE"]) \
+      else pd.Series([True]*len(df))
+
+    flagged = df[needs_check].copy()
+    n_flag  = len(flagged)
+    n_total = len(df)
+
+    k1,k2,k3 = st.columns(3)
+    for col, val, lbl, cls in [
+        (k1, f"{n_total:,}", "Total Rows",       "km"),
+        (k2, f"{n_flag:,}",  "Flagged for Check","ky"),
+        (k3, f"{n_total-n_flag:,}", "Auto-Pass", "kg"),
+    ]:
+        with col:
+            st.markdown(f'<div class="kc"><div class="kv {cls}">{val}</div><div class="kl">{lbl}</div></div>',
+                        unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Run Serper verification ────────────────────────────────────────────────
+    if has_serper and not S.verify_done:
+        c_run, c_skip = st.columns([2,1])
+        with c_run:
+            max_v = st.number_input("Max rows to verify via Serper (0 = all flagged)",
+                                    0, 5000, min(500, n_flag), key="max_verify")
+        with c_skip:
+            st.markdown("<br>", unsafe_allow_html=True)
+            skip_verify = st.button("Skip — proceed to export without Serper check",
+                                     use_container_width=True)
+        if skip_verify:
+            S.verify_done = True
+            st.rerun()
+
+        if st.button("🔍 Run Serper Verification", use_container_width=True, type="primary"):
+            batch = flagged.head(max_v) if max_v > 0 else flagged
+            unique_pairs = list({
+                (row["ORIGINAL_DESCRIPTION"], row["NPC_DESCRIPTION"])
+                for _, row in batch.iterrows()
+                if "ORIGINAL_DESCRIPTION" in row and "NPC_DESCRIPTION" in row
+            })
+            prog = st.progress(0, "Verifying…")
+            log_box = st.empty()
+            logs = []
+            def _log(msg):
+                logs.append(msg)
+                log_box.markdown('<div class="cb">' + "<br>".join(logs[-20:]) + "</div>",
+                                 unsafe_allow_html=True)
+
+            _log(f"Verifying {len(unique_pairs):,} unique pairs via Serper…")
+            cache = {}
+
+            def _do(pair):
+                orig, npc = pair
+                key = hashlib.md5((orig+"|"+npc).lower().encode()).hexdigest()
+                if key in S.verify_cache:
+                    return orig, npc, S.verify_cache[key]
+                result = SearchEngine.serper_verify(orig, npc)
+                S.verify_cache[key] = result
+                return orig, npc, result
+
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futures = {ex.submit(_do, p): p for p in unique_pairs}
+                done = 0
+                for fut in as_completed(futures):
+                    try:
+                        orig, npc, res = fut.result()
+                        cache_key = hashlib.md5((orig+"|"+npc).lower().encode()).hexdigest()
+                        cache[cache_key] = res
+                        v = res["verified"]
+                        icon = {"CONFIRMED":"✅","PARTIAL":"🟡","UNCONFIRMED":"🔴"}.get(v,"⚪")
+                        _log(f'<span class="co">{icon} {v}</span> · {orig[:55]}')
+                    except Exception as e:
+                        _log(f'<span class="ce">ERROR: {e}</span>')
+                    done += 1
+                    prog.progress(done / max(len(unique_pairs), 1), f"Verified {done}/{len(unique_pairs)}")
+
+            # Stamp results onto S.results
+            def _lookup(row):
+                key = hashlib.md5(
+                    (str(row.get("ORIGINAL_DESCRIPTION",""))+"|"+str(row.get("NPC_DESCRIPTION",""))).lower().encode()
+                ).hexdigest()
+                hit = cache.get(key, S.verify_cache.get(key))
+                if hit:
+                    return hit.get("verified","—"), hit.get("note",""), hit.get("snippet","")
+                return "NOT_CHECKED", "", ""
+
+            vstat, vnote, vsnip = zip(*[_lookup(r) for _, r in S.results.iterrows()]) \
+                if len(S.results) else ([], [], [])
+            S.results["SERPER_VERIFIED"] = list(vstat)
+            S.results["SERPER_NOTE"]     = list(vnote)
+            S.results["SERPER_SNIPPET"]  = list(vsnip)
+            S.verify_done = True
+            n_conf   = sum(1 for v in vstat if v == "CONFIRMED")
+            n_part   = sum(1 for v in vstat if v == "PARTIAL")
+            n_unconf = sum(1 for v in vstat if v == "UNCONFIRMED")
+            st.success(f"✓ Verification done — Confirmed: {n_conf} · Partial: {n_part} · Unconfirmed: {n_unconf}")
+            st.rerun()
+
+    # ── Results table after verification ──────────────────────────────────────
+    if S.verify_done:
+        df_v = S.results
+        if "SERPER_VERIFIED" in df_v.columns:
+            v_counts = df_v["SERPER_VERIFIED"].value_counts()
+            badges = {
+                "CONFIRMED":   ('<span style="color:#00e676">✅ CONFIRMED</span>',  int(v_counts.get("CONFIRMED",0))),
+                "PARTIAL":     ('<span style="color:#f0a500">🟡 PARTIAL</span>',    int(v_counts.get("PARTIAL",0))),
+                "UNCONFIRMED": ('<span style="color:#f85149">🔴 UNCONFIRMED</span>',int(v_counts.get("UNCONFIRMED",0))),
+                "NOT_CHECKED": ('<span style="color:#8b949e">⚪ NOT CHECKED</span>',int(v_counts.get("NOT_CHECKED",0))),
+                "SKIPPED":     ('<span style="color:#8b949e">— SKIPPED</span>',     int(v_counts.get("SKIPPED",0))),
+            }
+            parts = [f'{b} ({n:,})' for k,(b,n) in badges.items() if n > 0]
+            st.markdown("**Verification summary:** " + " &nbsp;·&nbsp; ".join(parts),
+                        unsafe_allow_html=True)
+
+        st.markdown('<div class="sh">Flagged rows</div>', unsafe_allow_html=True)
+
+        show_cols = ["RHIC_CODE","ORIGINAL_DESCRIPTION","NPC_CODE","NPC_DESCRIPTION",
+                     "MATCH_SOURCE","CONFIDENCE","VALIDATION_STATUS"]
+        if "SERPER_VERIFIED" in df_v.columns:
+            show_cols += ["SERPER_VERIFIED","SERPER_NOTE"]
+        show_cols = [c for c in show_cols if c in df_v.columns]
+
+        # Filter to flagged rows; show all if user wants
+        filt_opts = ["Flagged only","All rows"]
+        if "SERPER_VERIFIED" in df_v.columns:
+            filt_opts = ["Flagged only","Unconfirmed only","All rows"]
+        filt = st.radio("Show", filt_opts, horizontal=True, key="verify_filter")
+        view = df_v.copy()
+        if filt == "Flagged only":
+            view = view[needs_check]
+        elif filt == "Unconfirmed only" and "SERPER_VERIFIED" in view.columns:
+            view = view[view["SERPER_VERIFIED"].isin(["UNCONFIRMED","PARTIAL","NOT_CHECKED"])]
+
+        def vstyle(row):
+            v = row.get("SERPER_VERIFIED","")
+            if v == "CONFIRMED":   return ["background:rgba(0,230,118,.07)"]*len(row)
+            if v == "PARTIAL":     return ["background:rgba(240,165,0,.07)"]*len(row)
+            if v == "UNCONFIRMED": return ["background:rgba(248,81,73,.09)"]*len(row)
+            return ["background:rgba(139,148,158,.04)"]*len(row)
+
+        st.dataframe(
+            view[show_cols].style.apply(vstyle, axis=1).format(na_rep="—"),
+            use_container_width=True, height=400,
+        )
+
+        if "SERPER_SNIPPET" in df_v.columns:
+            with st.expander("📄 Show web snippets for flagged rows"):
+                for _, row in view[view.get("SERPER_VERIFIED","").isin(["PARTIAL","UNCONFIRMED"])
+                        if "SERPER_VERIFIED" in view.columns else pd.Series(dtype=bool)].head(30).iterrows():
+                    snip = row.get("SERPER_SNIPPET","")
+                    if snip:
+                        st.markdown(f'**{row.get("ORIGINAL_DESCRIPTION","")[:60]}** → '
+                                    f'`{row.get("NPC_DESCRIPTION","")[:60]}`')
+                        st.caption(snip)
+
+    st.markdown("---")
+    c1, _, c3 = st.columns([1,3,1])
+    with c1:
+        if st.button("← Back to Review", use_container_width=True): S.step=4; st.rerun()
+    with c3:
+        if st.button("Export →", use_container_width=True): S.step=6; st.rerun()
 
 
 def step_export():
@@ -1188,4 +1508,4 @@ def step_export():
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTER
 # ─────────────────────────────────────────────────────────────────────────────
-[step_upload, step_map, step_configure, step_process, step_review, step_export][S.step]()
+[step_upload, step_map, step_configure, step_process, step_review, step_verify, step_export][S.step]()
