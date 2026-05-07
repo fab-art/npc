@@ -1,11 +1,21 @@
+# Core
 streamlit>=1.35.0
 pandas>=2.0.0
 numpy>=1.24.0
-scikit-learn>=1.3.0
-rapidfuzz>=3.6.0
 openpyxl>=3.1.0
 requests>=2.31.0
 urllib3>=2.0.0
-# Optional — enables full semantic mode (install on server with GPU/RAM):
-sentence-transformers>=2.6.0
-torch>=2.0.0
+
+# AI — Semantic Engine (Tier-1, primary)
+sentence-transformers>=2.7.0
+torch>=2.0.0          # CPU-only fine: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Vector Search — optional but fast (Tier-1 retrieval)
+faiss-cpu>=1.7.4       # for 100k+ catalogs; falls back to numpy cosine
+
+# Fallback engines
+rapidfuzz>=3.6.0       # Tier-4: fuzzy hybrid score + fallback retrieval
+scikit-learn>=1.3.0    # Tier-3: TF-IDF fallback
+
+# Export
+xlsxwriter>=3.1.0
